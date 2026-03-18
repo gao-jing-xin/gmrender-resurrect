@@ -151,6 +151,22 @@ static int output_gstreamer_play(output_transition_cb_t callback) {
 			Log_error("gstreamer", "setting play state failed (1)");
 			// Error, but continue; can't get worse :)
 		}
+
+		if (dynamic_audio_router_bin_ != NULL) {
+            dynamic_audio_router_reset();
+
+            GstPad *entry_src_pad = gst_element_get_static_pad(dynamic_audio_entry_, "src");
+            if (entry_src_pad != NULL) {
+                dynamic_audio_probe_id_ = gst_pad_add_probe(
+                        entry_src_pad,
+                        GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
+                        dynamic_audio_router_probe_cb,
+                        NULL,
+                        NULL);
+                gst_object_unref(entry_src_pad);
+            }
+        }
+
 		g_object_set(G_OBJECT(player_), "uri", gsuri_, NULL);
 	}
 	if (gst_element_set_state(player_, GST_STATE_PLAYING) ==
@@ -162,6 +178,11 @@ static int output_gstreamer_play(output_transition_cb_t callback) {
 }
 
 static int output_gstreamer_stop(void) {
+
+	if (dynamic_audio_router_bin_ != NULL) {
+        dynamic_audio_router_reset();
+    }
+
 	if (gst_element_set_state(player_, GST_STATE_READY) ==
 	    GST_STATE_CHANGE_FAILURE) {
 		return -1;
@@ -373,10 +394,234 @@ static gboolean my_bus_callback(GstBus * bus, GstMessage * msg,
 static gchar *audio_sink = NULL;
 static gchar *audio_device = NULL;
 static gchar *audio_pipe = NULL;
+static gchar *audio_pipe_44100 = NULL;
+static GstElement *dynamic_audio_router_bin_ = NULL;
+static GstElement *dynamic_audio_entry_ = NULL;
+static GstElement *dynamic_audio_selected_sink_ = NULL;
+static guint dynamic_audio_probe_id_ = 0;
+
 static gchar *video_sink = NULL;
 static gchar *video_pipe = NULL;
 static double initial_db = 0.0;
 
+
+static void dynamic_audio_router_clear(void) {
+    if (dynamic_audio_entry_ == NULL) return;
+
+    GstPad *srcpad = gst_element_get_static_pad(dynamic_audio_entry_, "src");
+    if (srcpad != NULL) {
+        GstPad *peer = gst_pad_get_peer(srcpad);
+        if (peer != NULL) {
+            gst_pad_unlink(srcpad, peer);
+            gst_object_unref(peer);
+        }
+        gst_object_unref(srcpad);
+    }
+
+    if (dynamic_audio_selected_sink_ != NULL) {
+        gst_element_set_state(dynamic_audio_selected_sink_, GST_STATE_NULL);
+        if (dynamic_audio_router_bin_ != NULL) {
+            gst_bin_remove(GST_BIN(dynamic_audio_router_bin_), dynamic_audio_selected_sink_);
+        } else {
+            gst_object_unref(dynamic_audio_selected_sink_);
+        }
+        dynamic_audio_selected_sink_ = NULL;
+    }
+}
+
+static void dynamic_audio_router_reset(void) {
+    dynamic_audio_router_clear();
+
+    if (dynamic_audio_entry_ != NULL) {
+        GstPad *srcpad = gst_element_get_static_pad(dynamic_audio_entry_, "src");
+        if (srcpad != NULL) {
+            if (dynamic_audio_probe_id_ != 0) {
+                gst_pad_remove_probe(srcpad, dynamic_audio_probe_id_);
+                dynamic_audio_probe_id_ = 0;
+            }
+            gst_object_unref(srcpad);
+        }
+    }
+}
+
+static GstElement *create_audio_sink_from_pipe(const char *pipe_desc, const char *tag) {
+    if (pipe_desc == NULL || *pipe_desc == '\0') {
+        Log_error("gstreamer", "No pipeline configured for route: %s", tag ? tag : "(null)");
+        return NULL;
+    }
+
+    GError *err = NULL;
+    GstElement *sink = gst_parse_bin_from_description(pipe_desc, TRUE, &err);
+    if (sink == NULL) {
+        if (err != NULL) {
+            Log_error("gstreamer", "Could not create pipeline for route %s: %s",
+                      tag ? tag : "(null)", err->message);
+            g_error_free(err);
+        } else {
+            Log_error("gstreamer", "Could not create pipeline for route %s",
+                      tag ? tag : "(null)");
+        }
+        return NULL;
+    }
+    return sink;
+}
+
+static gboolean dynamic_audio_router_select_pipeline_from_caps(GstCaps *caps) {
+    if (caps == NULL || gst_caps_is_empty(caps)) {
+        Log_error("gstreamer", "dynamic audio router: empty caps");
+        return FALSE;
+    }
+
+    GstStructure *s = gst_caps_get_structure(caps, 0);
+    if (s == NULL) {
+        Log_error("gstreamer", "dynamic audio router: no caps structure");
+        return FALSE;
+    }
+
+    int rate = 0;
+    int channels = 0;
+    const gchar *format = gst_structure_get_string(s, "format");
+    gst_structure_get_int(s, "rate", &rate);
+    gst_structure_get_int(s, "channels", &channels);
+
+    const char *selected_pipe = NULL;
+    const char *selected_tag = NULL;
+
+    if (rate == 44100 && audio_pipe_44100 != NULL) {
+        selected_pipe = audio_pipe_44100;
+        selected_tag = "44100";
+    } else {
+        selected_pipe = audio_pipe;
+        selected_tag = "default";
+    }
+
+    if (selected_pipe == NULL) {
+        Log_error("gstreamer",
+                  "dynamic audio router: no pipeline configured. rate=%d channels=%d format=%s",
+                  rate, channels, format ? format : "(null)");
+        return FALSE;
+    }
+
+    Log_info("gstreamer",
+             "dynamic audio router: input caps format=%s rate=%d channels=%d, selecting route=%s",
+             format ? format : "(null)",
+             rate,
+             channels,
+             selected_tag);
+
+    GstElement *sink = create_audio_sink_from_pipe(selected_pipe, selected_tag);
+    if (sink == NULL) return FALSE;
+
+    gst_bin_add(GST_BIN(dynamic_audio_router_bin_), sink);
+
+    if (!gst_element_sync_state_with_parent(sink)) {
+        Log_error("gstreamer", "dynamic audio router: gst_element_sync_state_with_parent() failed");
+        gst_bin_remove(GST_BIN(dynamic_audio_router_bin_), sink);
+        return FALSE;
+    }
+
+    if (!gst_element_link(dynamic_audio_entry_, sink)) {
+        Log_error("gstreamer", "dynamic audio router: failed to link entry -> selected sink");
+        gst_element_set_state(sink, GST_STATE_NULL);
+        gst_bin_remove(GST_BIN(dynamic_audio_router_bin_), sink);
+        return FALSE;
+    }
+
+    dynamic_audio_selected_sink_ = sink;
+    return TRUE;
+}
+
+static GstPadProbeReturn dynamic_audio_router_probe_cb(
+        GstPad *pad, GstPadProbeInfo *info, gpointer userdata) {
+    (void)pad;
+    (void)userdata;
+
+    if ((GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM) == 0) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    GstEvent *event = gst_pad_probe_info_get_event(info);
+    if (event == NULL) return GST_PAD_PROBE_OK;
+
+    if (GST_EVENT_TYPE(event) == GST_EVENT_CAPS) {
+        GstCaps *caps = NULL;
+        gst_event_parse_caps(event, &caps);
+
+        if (dynamic_audio_selected_sink_ == NULL) {
+            if (!dynamic_audio_router_select_pipeline_from_caps(caps)) {
+                Log_error("gstreamer", "dynamic audio router: select pipeline from caps failed");
+                return GST_PAD_PROBE_DROP;
+            }
+
+            return GST_PAD_PROBE_REMOVE;
+        }
+    }
+
+    return GST_PAD_PROBE_OK;
+}
+
+static GstElement *create_dynamic_audio_router_bin(void) {
+    GstElement *bin = gst_bin_new("dynamic-audio-router");
+    if (bin == NULL) {
+        Log_error("gstreamer", "Could not create dynamic audio router bin");
+        return NULL;
+    }
+
+    GstElement *entry = gst_element_factory_make("identity", "dynamic-audio-entry");
+    if (entry == NULL) {
+        Log_error("gstreamer", "Could not create identity element for dynamic audio router");
+        gst_object_unref(bin);
+        return NULL;
+    }
+
+    gst_bin_add(GST_BIN(bin), entry);
+
+    GstPad *entry_sink_pad = gst_element_get_static_pad(entry, "sink");
+    if (entry_sink_pad == NULL) {
+        Log_error("gstreamer", "Could not get sink pad from dynamic audio entry");
+        gst_object_unref(bin);
+        return NULL;
+    }
+
+    GstPad *ghost_sink = gst_ghost_pad_new("sink", entry_sink_pad);
+    gst_object_unref(entry_sink_pad);
+    if (ghost_sink == NULL) {
+        Log_error("gstreamer", "Could not create ghost sink pad for dynamic audio router");
+        gst_object_unref(bin);
+        return NULL;
+    }
+
+    if (!gst_element_add_pad(bin, ghost_sink)) {
+        Log_error("gstreamer", "Could not add ghost sink pad to dynamic audio router");
+        gst_object_unref(ghost_sink);
+        gst_object_unref(bin);
+        return NULL;
+    }
+
+    dynamic_audio_router_bin_ = bin;
+    dynamic_audio_entry_ = entry;
+    dynamic_audio_selected_sink_ = NULL;
+    dynamic_audio_probe_id_ = 0;
+
+    GstPad *entry_src_pad = gst_element_get_static_pad(entry, "src");
+    if (entry_src_pad == NULL) {
+        Log_error("gstreamer", "Could not get src pad from dynamic audio entry");
+        gst_object_unref(bin);
+        dynamic_audio_router_bin_ = NULL;
+        dynamic_audio_entry_ = NULL;
+        return NULL;
+    }
+
+    dynamic_audio_probe_id_ = gst_pad_add_probe(
+            entry_src_pad,
+            GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
+            dynamic_audio_router_probe_cb,
+            NULL,
+            NULL);
+    gst_object_unref(entry_src_pad);
+
+    return bin;
+}
 /* Options specific to output_gstreamer */
 static GOptionEntry option_entries[] = {
         { "gstout-audiosink", 0, 0, G_OPTION_ARG_STRING, &audio_sink,
@@ -390,6 +635,9 @@ static GOptionEntry option_entries[] = {
           "GStreamer audio sink to pipeline"
           "(gst-launch format) useful for further output format conversion.",
 	  NULL },
+	    { "gstout-audiopipe-44100", 0, 0, G_OPTION_ARG_STRING, &audio_pipe_44100,
+          "GStreamer audio sink pipeline used when decoded input sample-rate is 44100 Hz.", 
+      NULL },
         { "gstout-videosink", 0, 0, G_OPTION_ARG_STRING, &video_sink,
           "GStreamer video sink to use "
 	  "(autovideosink, xvimagesink, ximagesink, ...)",
@@ -403,7 +651,7 @@ static GOptionEntry option_entries[] = {
           NULL },
         { "gstout-initial-volume-db", 0, 0, G_OPTION_ARG_DOUBLE, &initial_db,
           "GStreamer initial volume in decibel (e.g. 0.0 = max; -6 = 1/2 max) ",
-	  NULL },
+	  NULL },	  
         { NULL }
 };
 
@@ -536,10 +784,18 @@ static int output_gstreamer_init(void)
 	gst_bus_add_watch(bus, my_bus_callback, NULL);
 	gst_object_unref(bus);
 
-	if (audio_sink != NULL && audio_pipe != NULL) {
+	if (audio_sink != NULL &&
+		(audio_pipe != NULL || audio_pipe_44100 != NULL)) {
 		Log_error("gstreamer", "--gstout-audosink and --gstout-audiopipe are mutually exclusive.");
 		return 1;
 	}
+
+	if (audio_pipe == NULL && audio_pipe_44100 != NULL) {
+		Log_error("gstreamer",
+				"--gstout-audiopipe-44100 requires --gstout-audiopipe as the default route.");
+		return 1;
+	}
+
 	if (video_sink != NULL && video_pipe != NULL) {
 		Log_error("gstreamer", "--gstout-videosink and --gstout-videopipe are mutually exclusive.");
 		return 1;
@@ -560,7 +816,8 @@ static int output_gstreamer_init(void)
 		  g_object_set (G_OBJECT (player_), "audio-sink", sink, NULL);
 		}
 	}
-	if (audio_pipe != NULL) {
+	
+	if (audio_pipe != NULL && audio_pipe_44100 == NULL) {
 		GstElement *sink = NULL;
 		Log_info("gstreamer", "Setting audio sink-pipeline to %s\n",audio_pipe);
 		sink = gst_parse_bin_from_description(audio_pipe, TRUE, NULL);
@@ -570,6 +827,21 @@ static int output_gstreamer_init(void)
 		} else {
 			g_object_set (G_OBJECT (player_), "audio-sink", sink, NULL);
 		}
+	}
+	if (audio_pipe != NULL && audio_pipe_44100 != NULL) {
+		GstElement *sink = NULL;
+
+		Log_info("gstreamer", "Using dynamic audio router:");
+		Log_info("gstreamer", "  default pipeline: %s", audio_pipe);
+		Log_info("gstreamer", "  44100Hz pipeline: %s", audio_pipe_44100);
+
+		sink = create_dynamic_audio_router_bin();
+		if (sink == NULL) {
+			Log_error("gstreamer", "Could not create dynamic audio router.");
+			return 1;
+		}
+
+		g_object_set(G_OBJECT(player_), "audio-sink", sink, NULL);
 	}
 	if (video_sink != NULL) {
 		GstElement *sink = NULL;
