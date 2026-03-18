@@ -42,6 +42,16 @@
 #include "output_module.h"
 #include "output_gstreamer.h"
 
+
+static GstPadProbeReturn dynamic_audio_router_probe_cb(
+        GstPad *pad, GstPadProbeInfo *info, gpointer userdata);
+
+static gchar *audio_pipe_44100 = NULL;
+static GstElement *dynamic_audio_router_bin_ = NULL;
+static GstElement *dynamic_audio_entry_ = NULL;
+static GstElement *dynamic_audio_selected_sink_ = NULL;
+static guint dynamic_audio_probe_id_ = 0;
+
 static double buffer_duration = 0.0; /* Buffer disbled by default, see #182 */
 
 static void scan_mime_list(void)
@@ -394,11 +404,6 @@ static gboolean my_bus_callback(GstBus * bus, GstMessage * msg,
 static gchar *audio_sink = NULL;
 static gchar *audio_device = NULL;
 static gchar *audio_pipe = NULL;
-static gchar *audio_pipe_44100 = NULL;
-static GstElement *dynamic_audio_router_bin_ = NULL;
-static GstElement *dynamic_audio_entry_ = NULL;
-static GstElement *dynamic_audio_selected_sink_ = NULL;
-static guint dynamic_audio_probe_id_ = 0;
 
 static gchar *video_sink = NULL;
 static gchar *video_pipe = NULL;
