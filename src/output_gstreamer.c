@@ -46,6 +46,8 @@
 static GstPadProbeReturn dynamic_audio_router_probe_cb(
         GstPad *pad, GstPadProbeInfo *info, gpointer userdata);
 
+static void dynamic_audio_router_reset(void);
+
 static gchar *audio_pipe_44100 = NULL;
 static GstElement *dynamic_audio_router_bin_ = NULL;
 static GstElement *dynamic_audio_entry_ = NULL;
